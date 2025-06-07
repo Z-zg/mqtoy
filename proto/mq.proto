@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package mq;
+
+service Mq {
+    rpc SendMessage(SendMessageRequest) returns (SendMessageResponse) {}
+    rpc CommitMessage(CommitMessageRequest) returns (CommitMessageResponse) {}
+    rpc RollbackMessage(RollbackMessageRequest) returns (RollbackMessageResponse) {}
+}
+
+message SendMessageRequest {
+    string topic = 1;
+    bytes body = 2;
+}
+
+message SendMessageResponse {
+    string message_id = 1;
+}
+
+message CommitMessageRequest {
+    string message_id = 1;
+}
+
+message CommitMessageResponse {}
+
+message RollbackMessageRequest {
+    string message_id = 1;
+}
+
+message RollbackMessageResponse {} 

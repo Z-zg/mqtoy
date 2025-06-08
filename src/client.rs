@@ -195,7 +195,7 @@ mod tests {
                     }
                 }
                 Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(500)).await; // 增加等待时间
                     retries += 1;
                 }
             }
@@ -205,9 +205,18 @@ mod tests {
 
     async fn setup_test_client() -> MQClient {
         start_test_server().await;
-        MQClient::new("http://[::1]:50051".to_string())
-            .await
-            .expect("Failed to create client")
+        // 增加重试逻辑
+        let mut retries = 0;
+        while retries < 5 {
+            match MQClient::new("http://[::1]:50051".to_string()).await {
+                Ok(client) => return client,
+                Err(_) => {
+                    sleep(Duration::from_millis(500)).await;
+                    retries += 1;
+                }
+            }
+        }
+        panic!("Failed to create client after multiple retries");
     }
 
     #[tokio::test]

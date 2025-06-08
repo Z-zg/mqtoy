@@ -161,10 +161,24 @@ mod tests {
     use crate::message_queue::MessageQueue;
     use crate::server::run_server;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpListener;
+    use std::net::SocketAddr;
 
     static INIT: Once = Once::new();
     static mut SERVER_HANDLE: Option<JoinHandle<()>> = None;
     static SERVER_READY: AtomicBool = AtomicBool::new(false);
+
+    async fn wait_for_server(addr: &str) -> bool {
+        let mut retries = 0;
+        while retries < 10 {
+            if let Ok(_) = TcpListener::bind(addr).await {
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await;
+            retries += 1;
+        }
+        false
+    }
 
     async fn start_test_server() {
         INIT.call_once(|| {
@@ -174,7 +188,12 @@ mod tests {
             
             let server_handle = tokio::spawn(async move {
                 println!("Starting test server...");
-                run_server(Arc::new(message_queue), "[::1]:50051").await.unwrap();
+                // 先等待端口可用
+                let addr = "[::1]:50051";
+                if !wait_for_server(addr).await {
+                    panic!("Failed to bind to address {}", addr);
+                }
+                run_server(Arc::new(message_queue), addr).await.unwrap();
             });
             
             unsafe {
@@ -182,20 +201,19 @@ mod tests {
             }
         });
 
-        // Wait for server to be ready
+        // 等待服务器启动
         let mut retries = 0;
         while !SERVER_READY.load(Ordering::Relaxed) && retries < 10 {
             match MQClient::new("http://[::1]:50051".to_string()).await {
-                Ok(_) => {
-                    // Try to create a topic to ensure server is fully operational
-                    let mut client = MQClient::new("http://[::1]:50051".to_string()).await.unwrap();
+                Ok(mut client) => {
+                    // 尝试创建主题来验证服务器是否完全就绪
                     if client.create_topic("test-ready").await.is_ok() {
                         SERVER_READY.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
                 Err(_) => {
-                    sleep(Duration::from_millis(500)).await; // 增加等待时间
+                    sleep(Duration::from_millis(500)).await;
                     retries += 1;
                 }
             }
@@ -205,13 +223,18 @@ mod tests {
 
     async fn setup_test_client() -> MQClient {
         start_test_server().await;
-        // 增加重试逻辑
+        
+        // 等待服务器完全就绪
+        sleep(Duration::from_secs(1)).await;
+        
+        // 尝试连接
         let mut retries = 0;
         while retries < 5 {
             match MQClient::new("http://[::1]:50051".to_string()).await {
                 Ok(client) => return client,
-                Err(_) => {
-                    sleep(Duration::from_millis(500)).await;
+                Err(e) => {
+                    println!("Failed to connect: {:?}", e);
+                    sleep(Duration::from_secs(1)).await;
                     retries += 1;
                 }
             }

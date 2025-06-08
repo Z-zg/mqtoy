@@ -37,13 +37,18 @@ impl Coordinator {
     }
 
     pub async fn elect_leader(&self) -> Option<Uuid> {
-        let nodes = self.nodes.read().await;
+        let mut nodes = self.nodes.write().await;
         if nodes.is_empty() {
             return None;
         }
 
         // Simple leader election: choose the node with the lowest UUID
         let leader_id = nodes.keys().min().cloned()?;
+        
+        // Update the leader's status
+        if let Some(leader) = nodes.get_mut(&leader_id) {
+            leader.is_leader = true;
+        }
         
         let mut current_leader = self.current_leader.write().await;
         *current_leader = Some(leader_id);

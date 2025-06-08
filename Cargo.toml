@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sled = "0.34"
@@ -15,6 +16,9 @@ tracing-subscriber = "0.3"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 async-trait = "0.1"
 thiserror = "1.0"
+structopt = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
 
 [build-dependencies]
 tonic-build = "0.11"

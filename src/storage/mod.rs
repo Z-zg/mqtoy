@@ -114,4 +114,102 @@ mod tests {
             Err(StorageError::MessageNotFound)
         ));
     }
+
+    #[test]
+    fn test_message_status_transitions() {
+        let temp_dir = tempdir().unwrap();
+        let storage = MessageStorage::new(temp_dir.path()).unwrap();
+
+        let message = Message {
+            id: Uuid::new_v4(),
+            topic: "test".to_string(),
+            body: vec![1, 2, 3],
+            status: MessageStatus::Pending,
+            created_at: 1234567890,
+        };
+
+        storage.store_message(&message).unwrap();
+
+        // Test all possible status transitions
+        storage
+            .update_message_status(message.id, MessageStatus::Committed)
+            .unwrap();
+        let committed = storage.get_message(message.id).unwrap();
+        assert_eq!(committed.status, MessageStatus::Committed);
+
+        storage
+            .update_message_status(message.id, MessageStatus::Rollback)
+            .unwrap();
+        let rolled_back = storage.get_message(message.id).unwrap();
+        assert_eq!(rolled_back.status, MessageStatus::Rollback);
+
+        storage
+            .update_message_status(message.id, MessageStatus::Pending)
+            .unwrap();
+        let pending = storage.get_message(message.id).unwrap();
+        assert_eq!(pending.status, MessageStatus::Pending);
+    }
+
+    #[test]
+    fn test_multiple_messages() {
+        let temp_dir = tempdir().unwrap();
+        let storage = MessageStorage::new(temp_dir.path()).unwrap();
+
+        // Store multiple messages
+        let messages: Vec<Message> = (0..5)
+            .map(|i| Message {
+                id: Uuid::new_v4(),
+                topic: format!("topic-{}", i),
+                body: vec![i as u8],
+                status: MessageStatus::Pending,
+                created_at: 1234567890 + i as i64,
+            })
+            .collect();
+
+        for message in &messages {
+            storage.store_message(message).unwrap();
+        }
+
+        // Verify all messages can be retrieved
+        for message in &messages {
+            let retrieved = storage.get_message(message.id).unwrap();
+            assert_eq!(retrieved.id, message.id);
+            assert_eq!(retrieved.topic, message.topic);
+            assert_eq!(retrieved.body, message.body);
+        }
+    }
+
+    #[test]
+    fn test_storage_persistence() {
+        let temp_dir = tempdir().unwrap();
+        let storage_path = temp_dir.path();
+
+        // Create and store a message
+        let storage = MessageStorage::new(storage_path).unwrap();
+        let message = Message {
+            id: Uuid::new_v4(),
+            topic: "test".to_string(),
+            body: vec![1, 2, 3],
+            status: MessageStatus::Pending,
+            created_at: 1234567890,
+        };
+        storage.store_message(&message).unwrap();
+
+        // Drop the first storage instance to release the lock
+        drop(storage);
+
+        // Create a new storage instance with the same path
+        let new_storage = MessageStorage::new(storage_path).unwrap();
+        let retrieved = new_storage.get_message(message.id).unwrap();
+        assert_eq!(retrieved.id, message.id);
+        assert_eq!(retrieved.topic, message.topic);
+        assert_eq!(retrieved.body, message.body);
+        assert_eq!(retrieved.status, message.status);
+    }
+
+    #[test]
+    fn test_invalid_storage_path() {
+        let result = MessageStorage::new("/invalid/path/that/does/not/exist");
+        assert!(result.is_err());
+    }
 } 

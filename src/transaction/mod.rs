@@ -65,12 +65,19 @@ impl TransactionManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use tokio::time::sleep;
+
+    async fn setup_test_manager() -> (TransactionManager, String) {
+        let temp_dir = tempdir().unwrap();
+        let storage_path = temp_dir.path().to_str().unwrap().to_string();
+        let storage = MessageStorage::new(temp_dir.path()).unwrap();
+        let manager = TransactionManager::new(storage, Duration::from_millis(100));
+        (manager, storage_path)
+    }
 
     #[tokio::test]
     async fn test_transaction_manager() {
-        let temp_dir = tempdir().unwrap();
-        let storage = MessageStorage::new(temp_dir.path()).unwrap();
-        let manager = TransactionManager::new(storage, Duration::from_secs(1));
+        let (manager, _) = setup_test_manager().await;
 
         // Test preparing a message
         let topic = "test".to_string();
@@ -93,5 +100,108 @@ mod tests {
         manager.rollback_message(message_id).unwrap();
         let rolled_back_message = manager.storage.get_message(message_id).unwrap();
         assert_eq!(rolled_back_message.status, MessageStatus::Rollback);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_transactions() {
+        let (manager, _) = setup_test_manager().await;
+
+        // Prepare multiple messages concurrently
+        let mut handles = vec![];
+        for i in 0..5 {
+            let manager_clone = manager.clone();
+            let handle = tokio::spawn(async move {
+                let topic = format!("topic-{}", i);
+                let body = vec![i as u8];
+                let message_id = manager_clone.prepare_message(topic, body).unwrap();
+                sleep(Duration::from_millis(50)).await;
+                manager_clone.commit_message(message_id).unwrap();
+                message_id
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all transactions to complete
+        let message_ids: Vec<Uuid> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Verify all messages are committed
+        for message_id in message_ids {
+            let message = manager.storage.get_message(message_id).unwrap();
+            assert_eq!(message.status, MessageStatus::Committed);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transaction_rollback() {
+        let (manager, _) = setup_test_manager().await;
+
+        // Prepare a message
+        let topic = "test".to_string();
+        let body = vec![1, 2, 3];
+        let message_id = manager.prepare_message(topic.clone(), body.clone()).unwrap();
+
+        // Verify initial state
+        let message = manager.storage.get_message(message_id).unwrap();
+        assert_eq!(message.status, MessageStatus::Pending);
+
+        // Rollback the message
+        manager.rollback_message(message_id).unwrap();
+
+        // Verify rollback state
+        let message = manager.storage.get_message(message_id).unwrap();
+        assert_eq!(message.status, MessageStatus::Rollback);
+
+        // Try to commit after rollback
+        manager.commit_message(message_id).unwrap();
+        let message = manager.storage.get_message(message_id).unwrap();
+        assert_eq!(message.status, MessageStatus::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_message_checking() {
+        let (manager, _) = setup_test_manager().await;
+
+        // Prepare a message
+        let topic = "test".to_string();
+        let body = vec![1, 2, 3];
+        let message_id = manager.prepare_message(topic, body).unwrap();
+
+        // Start the checking process
+        let manager_clone = manager.clone();
+        let check_handle = tokio::spawn(async move {
+            manager_clone.start_checking().await;
+        });
+
+        // Wait for a short time to allow checking to occur
+        sleep(Duration::from_millis(200)).await;
+
+        // Cancel the checking process
+        check_handle.abort();
+
+        // Verify the message is still in pending state
+        let message = manager.storage.get_message(message_id).unwrap();
+        assert_eq!(message.status, MessageStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_message_id() {
+        let (manager, _) = setup_test_manager().await;
+        let invalid_id = Uuid::new_v4();
+
+        // Try to commit non-existent message
+        assert!(matches!(
+            manager.commit_message(invalid_id),
+            Err(StorageError::MessageNotFound)
+        ));
+
+        // Try to rollback non-existent message
+        assert!(matches!(
+            manager.rollback_message(invalid_id),
+            Err(StorageError::MessageNotFound)
+        ));
     }
 } 

@@ -4,6 +4,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
+use flate2::{Compress, Decompress, Compression};
+use std::io::Write;
+use flate2::write::ZlibEncoder;
+use flate2::read::ZlibDecoder;
+use std::io::Read;
 
 #[derive(Debug, Error)]
 pub enum MQError {
@@ -13,6 +18,8 @@ pub enum MQError {
     ConsumerGroupNotFound(String),
     #[error("Storage error: {0}")]
     StorageError(String),
+    #[error("Compression error: {0}")]
+    CompressionError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +29,59 @@ pub struct Message {
     pub payload: Vec<u8>,
     pub timestamp: i64,
     pub headers: HashMap<String, String>,
+    pub is_compressed: bool,
+}
+
+impl Message {
+    pub fn new(topic: String, payload: Vec<u8>, headers: HashMap<String, String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            topic,
+            payload,
+            timestamp: chrono::Utc::now().timestamp(),
+            headers,
+            is_compressed: false,
+        }
+    }
+
+    pub fn compress(&mut self) -> Result<(), MQError> {
+        if self.is_compressed {
+            return Ok(());
+        }
+        if self.payload.len() <= 1024 {
+            // Do not compress small messages
+            return Ok(());
+        }
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&self.payload)
+            .map_err(|e| MQError::CompressionError(format!("Failed to compress message: {}", e)))?;
+        let compressed = encoder.finish()
+            .map_err(|e| MQError::CompressionError(format!("Failed to finish compression: {}", e)))?;
+
+        if compressed.len() < self.payload.len() {
+            self.payload = compressed;
+            self.is_compressed = true;
+            self.headers.insert("compression".to_string(), "deflate".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn decompress(&mut self) -> Result<(), MQError> {
+        if !self.is_compressed {
+            return Ok(());
+        }
+
+        let mut decoder = ZlibDecoder::new(&self.payload[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .map_err(|e| MQError::CompressionError(format!("Failed to decompress message: {}", e)))?;
+
+        self.payload = decompressed;
+        self.is_compressed = false;
+        self.headers.remove("compression");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +218,7 @@ mod tests {
             payload: b"test message".to_vec(),
             timestamp: chrono::Utc::now().timestamp(),
             headers: HashMap::new(),
+            is_compressed: false,
         };
         mq.publish("test-topic", message.clone()).await.unwrap();
 
@@ -189,6 +250,7 @@ mod tests {
                 payload: format!("message {}", i).into_bytes(),
                 timestamp: chrono::Utc::now().timestamp(),
                 headers: HashMap::new(),
+                is_compressed: false,
             };
             mq.publish("test-topic", message).await.unwrap();
         }
@@ -231,6 +293,7 @@ mod tests {
             payload: b"test".to_vec(),
             timestamp: chrono::Utc::now().timestamp(),
             headers: HashMap::new(),
+            is_compressed: false,
         };
         assert!(matches!(
             mq.publish("non-existent", message).await,
@@ -276,6 +339,7 @@ mod tests {
             payload: b"test message".to_vec(),
             timestamp: chrono::Utc::now().timestamp(),
             headers: headers.clone(),
+            is_compressed: false,
         };
 
         // Publish and verify headers
@@ -304,6 +368,7 @@ mod tests {
                     payload: format!("message {}", i).into_bytes(),
                     timestamp: chrono::Utc::now().timestamp(),
                     headers: HashMap::new(),
+                    is_compressed: false,
                 };
                 mq_clone.publish("test-topic", message).await
             });
@@ -321,5 +386,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(messages.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_message_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_string();
+        let mq = MessageQueue::new(&storage_path).unwrap();
+
+        // Create a large message that should be compressed
+        let large_payload = vec![0u8; 2048]; // 2KB of zeros
+        let mut message = Message::new(
+            "test-topic".to_string(),
+            large_payload.clone(),
+            HashMap::new(),
+        );
+
+        // Test compression
+        message.compress().unwrap();
+        assert!(message.is_compressed);
+        assert!(message.payload.len() < large_payload.len()); // Compressed size should be smaller
+        assert_eq!(message.headers.get("compression").unwrap(), "deflate");
+
+        // Test decompression
+        message.decompress().unwrap();
+        assert!(!message.is_compressed);
+        assert_eq!(message.payload.len(), large_payload.len()); // Length should match after decompression
+        assert!(!message.headers.contains_key("compression"));
+
+        // Test that small messages aren't compressed
+        let small_payload = vec![0u8; 100]; // 100 bytes
+        let mut small_message = Message::new(
+            "test-topic".to_string(),
+            small_payload.clone(),
+            HashMap::new(),
+        );
+        small_message.compress().unwrap();
+        assert!(!small_message.is_compressed);
+        assert_eq!(small_message.payload, small_payload);
+    }
+
+    #[tokio::test]
+    async fn test_compression_error_handling() {
+        let dir = tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_string();
+        let mq = MessageQueue::new(&storage_path).unwrap();
+
+        // Create a message with invalid compression flag
+        let mut message = Message::new(
+            "test-topic".to_string(),
+            vec![0u8; 100],
+            HashMap::new(),
+        );
+        message.is_compressed = true; // Set compression flag without actually compressing
+
+        // Attempting to decompress should fail
+        assert!(matches!(
+            message.decompress(),
+            Err(MQError::CompressionError(_))
+        ));
     }
 } 

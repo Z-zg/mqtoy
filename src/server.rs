@@ -35,13 +35,20 @@ impl MessageQueueService for MQServer {
             return Err(Status::not_found(format!("Topic '{}' not found", req.topic)));
         }
 
-        let message = Message {
+        let mut message = Message {
             id: Uuid::new_v4(),
             topic: req.topic.clone(),
             payload: req.payload,
             timestamp: chrono::Utc::now().timestamp(),
             headers: req.headers,
+            is_compressed: false,
         };
+
+        // Compress the message if it's large enough
+        if message.payload.len() > 1024 { // Only compress messages larger than 1KB
+            message.compress()
+                .map_err(|e| Status::internal(format!("Failed to compress message: {}", e)))?;
+        }
 
         self.message_queue
             .publish(&req.topic, message.clone())
@@ -71,7 +78,15 @@ impl MessageQueueService for MQServer {
                 .subscribe(&req.topic, &req.consumer_group, &req.consumer_id)
                 .await;
             if let Ok(messages) = messages {
-                for msg in messages {
+                for mut msg in messages {
+                    // Decompress the message if it's compressed
+                    if msg.is_compressed {
+                        if let Err(e) = msg.decompress() {
+                            eprintln!("Failed to decompress message: {}", e);
+                            continue;
+                        }
+                    }
+
                     let proto_msg = mq::Message {
                         id: msg.id.to_string(),
                         topic: msg.topic,

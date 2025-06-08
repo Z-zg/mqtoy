@@ -1,7 +1,11 @@
 [package]
 name = "mq"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[example]]
+name = "client_example"
+path = "examples/client_example.rs"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
@@ -19,6 +23,8 @@ thiserror = "1.0"
 structopt = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+flate2 = { version = "1.0", features = ["zlib"] }
+clap = { version = "4.4", features = ["derive"] }
 
 [build-dependencies]
 tonic-build = "0.11"

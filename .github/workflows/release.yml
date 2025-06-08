@@ -32,10 +32,10 @@ jobs:
             artifact_name: mq-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           target: ${{ matrix.target }}
@@ -66,7 +66,7 @@ jobs:
           cp target/${{ matrix.target }}/release/mq-monitoring dist/mq-monitoring-${{ matrix.artifact_name }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/
@@ -76,18 +76,16 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref }}
           release_name: Release ${{ github.ref }}
@@ -95,51 +93,14 @@ jobs:
           prerelease: false
 
       - name: Upload Release Assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/mq-linux-x86_64/mq-server-mq-linux-x86_64
-          asset_name: mq-server-linux-x86_64
-          asset_content_type: application/octet-stream
-
-      - name: Upload Release Assets (Linux ARM64)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/mq-linux-aarch64/mq-server-mq-linux-aarch64
-          asset_name: mq-server-linux-aarch64
-          asset_content_type: application/octet-stream
-
-      - name: Upload Release Assets (macOS x86_64)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/mq-macos-x86_64/mq-server-mq-macos-x86_64
-          asset_name: mq-server-macos-x86_64
-          asset_content_type: application/octet-stream
-
-      - name: Upload Release Assets (macOS ARM64)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/mq-macos-aarch64/mq-server-mq-macos-aarch64
-          asset_name: mq-server-macos-aarch64
-          asset_content_type: application/octet-stream
-
-      - name: Upload Release Assets (Windows)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./artifacts/mq-windows-x86_64.exe/mq-server-mq-windows-x86_64.exe
-          asset_name: mq-server-windows-x86_64.exe
-          asset_content_type: application/octet-stream 
+          files: |
+            artifacts/mq-linux-x86_64/mq-server-mq-linux-x86_64
+            artifacts/mq-linux-aarch64/mq-server-mq-linux-aarch64
+            artifacts/mq-macos-x86_64/mq-server-mq-macos-x86_64
+            artifacts/mq-macos-aarch64/mq-server-mq-macos-aarch64
+            artifacts/mq-windows-x86_64.exe/mq-server-mq-windows-x86_64.exe
+          tag_name: ${{ github.ref }}
+          draft: false
+          prerelease: false 

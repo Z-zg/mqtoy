@@ -8,29 +8,33 @@ name = "client_example"
 path = "examples/client_example.rs"
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sled = "0.34"
-tonic = "0.11"
+tonic = "0.10"
 prost = "0.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 async-trait = "0.1"
 thiserror = "1.0"
 structopt = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
-flate2 = { version = "1.0", features = ["zlib"] }
+flate2 = "1.0"
 clap = { version = "4.4", features = ["derive"] }
-aes-gcm = "0.10.3"
-base64 = "0.21.7"
-getrandom = "0.2.11"
+aes-gcm = "0.10"
+base64 = "0.21"
+getrandom = "0.2"
+actix-web = "4.4"
+actix-rt = "2.9"
+prometheus = "0.13"
+lazy_static = "1.4"
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.10"
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use uuid::Uuid;
 use std::error::Error as StdError;
+use std::sync::Arc;
 
 use crate::message_queue::Message;
 use mq::message_queue_service_client::MessageQueueServiceClient;
@@ -40,6 +41,8 @@ impl MQClient {
         let request = CreateTopicRequest {
             name: name.to_string(),
             partition_count: Some(3), // Default to 3 partitions
+            max_age_seconds: None,    // Use default retention policy
+            max_size_bytes: None,     // Use default retention policy
         };
         let response = self.client.create_topic(request).await?;
         Ok(response.into_inner().success)
@@ -50,6 +53,7 @@ impl MQClient {
         topic: &str,
         payload: Vec<u8>,
         headers: HashMap<String, String>,
+        dlq: Option<bool>,
     ) -> Result<String, Box<dyn StdError + Send + Sync>> {
         let mut message = Message {
             id: Uuid::new_v4(),
@@ -72,6 +76,7 @@ impl MQClient {
             payload: message.payload,
             headers: message.headers,
             partition: None, // Let server choose partition
+            dlq,
         };
         let response = self.client.publish(request).await?;
         Ok(response.into_inner().message_id)
@@ -81,10 +86,16 @@ impl MQClient {
         &mut self,
         topic: &str,
         partition: Option<usize>,
+        replay_offset: Option<usize>,
+        replay_timestamp: Option<i64>,
+        dlq: Option<bool>,
     ) -> Result<mpsc::Receiver<Result<Message, Box<dyn StdError + Send + Sync>>>, Box<dyn StdError + Send + Sync>> {
         let request = SubscribeRequest {
             topic: topic.to_string(),
             partition: partition.map(|p| p as u32),
+            replay_offset: replay_offset.map(|o| o as u64),
+            replay_timestamp,
+            dlq,
         };
 
         let response = self.client.subscribe(request).await?;
@@ -163,7 +174,7 @@ mod tests {
             
             let server_handle = tokio::spawn(async move {
                 println!("Starting test server...");
-                run_server(message_queue, "[::1]:50051").await.unwrap();
+                run_server(Arc::new(message_queue), "[::1]:50051").await.unwrap();
             });
             
             unsafe {
@@ -215,6 +226,7 @@ mod tests {
                 "test-topic",
                 b"Hello, World!".to_vec(),
                 headers.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -222,7 +234,7 @@ mod tests {
 
         // Subscribe to messages
         let mut rx = client
-            .subscribe("test-topic", None)
+            .subscribe("test-topic", None, None, None, None)
             .await
             .unwrap();
 
@@ -247,12 +259,13 @@ mod tests {
                 "non-existent",
                 b"test".to_vec(),
                 HashMap::new(),
+                None,
             )
             .await;
         assert!(result.is_err());
 
         // Try to subscribe to non-existent topic
-        let result = client.subscribe("non-existent", None).await;
+        let result = client.subscribe("non-existent", None, None, None, None).await;
         assert!(result.is_err());
     }
 
@@ -274,6 +287,7 @@ mod tests {
                         &topic,
                         message.as_bytes().to_vec(),
                         HashMap::new(),
+                        None,
                     )
                     .await
             });
@@ -287,7 +301,7 @@ mod tests {
 
         // Subscribe and verify messages
         let mut rx = client
-            .subscribe(&topic, None)
+            .subscribe(&topic, None, None, None, None)
             .await
             .unwrap();
 
@@ -313,18 +327,19 @@ mod tests {
 
         // Publish a large message that should be compressed
         let large_payload = vec![0u8; 2048]; // 2KB payload
-        let message_id = client
+        let _message_id = client
             .publish(
                 "compression-test",
                 large_payload.clone(),
                 HashMap::new(),
+                None,
             )
             .await
             .unwrap();
 
         // Subscribe and verify the message
         let mut rx = client
-            .subscribe("compression-test", None)
+            .subscribe("compression-test", None, None, None, None)
             .await
             .unwrap();
 
@@ -346,18 +361,19 @@ mod tests {
 
         // Publish an encrypted message
         let payload = b"Hello, encrypted world!".to_vec();
-        let message_id = client
+        let _message_id = client
             .publish(
                 "encryption-test",
                 payload.clone(),
                 HashMap::new(),
+                None,
             )
             .await
             .unwrap();
 
         // Subscribe and verify the message
         let mut rx = client
-            .subscribe("encryption-test", None)
+            .subscribe("encryption-test", None, None, None, None)
             .await
             .unwrap();
 

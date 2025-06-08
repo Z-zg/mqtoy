@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
-use flate2::{Compress, Decompress, Compression};
+use flate2::Compression;
 use std::io::Write;
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
@@ -31,6 +31,7 @@ pub enum MQError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(with = "uuid::serde::compact")]
     pub id: Uuid,
     pub topic: String,
     pub payload: Vec<u8>,
@@ -169,10 +170,18 @@ pub struct Partition {
 }
 
 #[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    pub max_age_seconds: Option<u64>,
+    pub max_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Topic {
     pub name: String,
     pub partitions: Vec<Partition>,
+    pub dlq: Partition, // Dead Letter Queue partition
     pub partition_count: usize,
+    pub retention_policy: RetentionPolicy,
 }
 
 #[derive(Clone)]
@@ -186,10 +195,21 @@ impl MessageQueue {
         let db = sled::open(storage_path)
             .map_err(|e| MQError::StorageError(e.to_string()))?;
         
-        Ok(Self {
+        let mq = Self {
             topics: Arc::new(RwLock::new(HashMap::new())),
             storage: Arc::new(RwLock::new(db)),
-        })
+        };
+
+        // Start retention policy enforcement task
+        let mq_clone = mq.clone();
+        tokio::spawn(async move {
+            loop {
+                mq_clone.enforce_retention_policies().await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        Ok(mq)
     }
 
     pub async fn topic_exists(&self, name: &str) -> bool {
@@ -197,25 +217,36 @@ impl MessageQueue {
         topics.contains_key(name)
     }
 
-    pub async fn create_topic_with_partitions(&self, name: &str, partition_count: usize) {
+    pub async fn create_topic_with_partitions(
+        &self,
+        name: &str,
+        partition_count: usize,
+        retention_policy: Option<RetentionPolicy>,
+    ) {
         let mut topics = self.topics.write().await;
         if !topics.contains_key(name) {
             let partitions = (0..partition_count)
                 .map(|id| Partition { id, messages: Vec::new() })
                 .collect();
+            let dlq = Partition { id: partition_count, messages: Vec::new() };
             topics.insert(
                 name.to_string(),
                 Topic {
                     name: name.to_string(),
                     partitions,
+                    dlq,
                     partition_count,
+                    retention_policy: retention_policy.unwrap_or(RetentionPolicy {
+                        max_age_seconds: Some(7 * 24 * 60 * 60), // Default 7 days
+                        max_size_bytes: Some(1024 * 1024 * 1024), // Default 1GB
+                    }),
                 },
             );
         }
     }
 
     pub async fn create_topic(&self, name: &str) {
-        self.create_topic_with_partitions(name, 3).await;
+        self.create_topic_with_partitions(name, 3, None).await;
     }
 
     pub async fn publish(&self, topic: &str, message: Message) -> Result<(), MQError> {
@@ -227,23 +258,84 @@ impl MessageQueue {
         Ok(())
     }
 
-    pub async fn subscribe(&self, topic: &str, partition: Option<usize>) -> Result<Vec<Message>, MQError> {
+    pub async fn publish_dlq(&self, topic: &str, message: Message) -> Result<(), MQError> {
+        let mut topics = self.topics.write().await;
+        let topic_obj = topics.get_mut(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        topic_obj.dlq.messages.push(message);
+        Ok(())
+    }
+
+    pub async fn subscribe(&self, topic: &str, partition: Option<usize>, replay_offset: Option<usize>, replay_timestamp: Option<i64>, dlq: bool) -> Result<Vec<Message>, MQError> {
+        if dlq {
+            return self.subscribe_dlq(topic).await;
+        }
         let topics = self.topics.read().await;
         let topic_obj = topics.get(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
         let mut messages = Vec::new();
         match partition {
             Some(pid) => {
                 if let Some(partition) = topic_obj.partitions.get(pid) {
-                    messages.extend_from_slice(&partition.messages);
+                    let mut msgs = partition.messages.clone();
+                    if let Some(offset) = replay_offset {
+                        if offset < msgs.len() {
+                            msgs = msgs[offset..].to_vec();
+                        } else {
+                            msgs.clear();
+                        }
+                    }
+                    if let Some(ts) = replay_timestamp {
+                        msgs = msgs.into_iter().filter(|m| m.timestamp >= ts).collect();
+                    }
+                    messages.extend(msgs);
                 }
             }
             None => {
                 for partition in &topic_obj.partitions {
-                    messages.extend_from_slice(&partition.messages);
+                    let mut msgs = partition.messages.clone();
+                    if let Some(offset) = replay_offset {
+                        if offset < msgs.len() {
+                            msgs = msgs[offset..].to_vec();
+                        } else {
+                            msgs.clear();
+                        }
+                    }
+                    if let Some(ts) = replay_timestamp {
+                        msgs = msgs.into_iter().filter(|m| m.timestamp >= ts).collect();
+                    }
+                    messages.extend(msgs);
                 }
             }
         }
         Ok(messages)
+    }
+
+    pub async fn subscribe_dlq(&self, topic: &str) -> Result<Vec<Message>, MQError> {
+        let topics = self.topics.read().await;
+        let topic_obj = topics.get(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        Ok(topic_obj.dlq.messages.clone())
+    }
+
+    pub async fn replay_from_offset(&self, topic: &str, partition: usize, offset: usize) -> Result<Vec<Message>, MQError> {
+        let topics = self.topics.read().await;
+        let topic_obj = topics.get(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        if let Some(partition) = topic_obj.partitions.get(partition) {
+            if offset < partition.messages.len() {
+                return Ok(partition.messages[offset..].to_vec());
+            } else {
+                return Ok(vec![]);
+            }
+        }
+        Err(MQError::TopicNotFound(topic.to_string()))
+    }
+
+    pub async fn replay_from_timestamp(&self, topic: &str, partition: usize, timestamp: i64) -> Result<Vec<Message>, MQError> {
+        let topics = self.topics.read().await;
+        let topic_obj = topics.get(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        if let Some(partition) = topic_obj.partitions.get(partition) {
+            let msgs: Vec<_> = partition.messages.iter().filter(|m| m.timestamp >= timestamp).cloned().collect();
+            return Ok(msgs);
+        }
+        Err(MQError::TopicNotFound(topic.to_string()))
     }
 
     pub async fn commit_offset(
@@ -268,6 +360,43 @@ impl MessageQueue {
             }
         }
         Ok(())
+    }
+
+    async fn enforce_retention_policies(&self) {
+        let mut topics = self.topics.write().await;
+        let now = chrono::Utc::now().timestamp();
+
+        for topic in topics.values_mut() {
+            for partition in &mut topic.partitions {
+                // Enforce time-based retention
+                if let Some(max_age) = topic.retention_policy.max_age_seconds {
+                    partition.messages.retain(|msg| {
+                        (now - msg.timestamp) <= max_age as i64
+                    });
+                }
+
+                // Enforce size-based retention
+                if let Some(max_size) = topic.retention_policy.max_size_bytes {
+                    let mut current_size = 0;
+                    let mut i = partition.messages.len();
+                    
+                    // Calculate size from newest to oldest messages
+                    while i > 0 {
+                        i -= 1;
+                        current_size += partition.messages[i].payload.len();
+                        if current_size > max_size as usize {
+                            partition.messages.drain(..i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_all_topics(&self) -> Vec<Topic> {
+        let topics = self.topics.read().await;
+        topics.values().cloned().collect()
     }
 }
 
@@ -298,7 +427,7 @@ mod tests {
 
         // Subscribe and receive message
         let messages = mq
-            .subscribe("test-topic", None)
+            .subscribe("test-topic", None, None, None, false)
             .await
             .unwrap();
         assert_eq!(messages.len(), 1);
@@ -316,7 +445,7 @@ mod tests {
         let mq = MessageQueue::new(dir.path().to_str().unwrap()).unwrap();
 
         // Create topic and publish messages
-        mq.create_topic_with_partitions("test-topic", 3).await;
+        mq.create_topic_with_partitions("test-topic", 3, None).await;
         for i in 0..3 {
             let message = Message {
                 id: Uuid::new_v4(),
@@ -332,15 +461,15 @@ mod tests {
 
         // Subscribe with multiple consumers to different partitions
         let messages1 = mq
-            .subscribe("test-topic", Some(0))
+            .subscribe("test-topic", Some(0), None, None, false)
             .await
             .unwrap();
         let messages2 = mq
-            .subscribe("test-topic", Some(1))
+            .subscribe("test-topic", Some(1), None, None, false)
             .await
             .unwrap();
         let messages3 = mq
-            .subscribe("test-topic", Some(2))
+            .subscribe("test-topic", Some(2), None, None, false)
             .await
             .unwrap();
 
@@ -354,7 +483,7 @@ mod tests {
 
         // Subscribe again to first partition
         let messages1_after = mq
-            .subscribe("test-topic", Some(0))
+            .subscribe("test-topic", Some(0), None, None, false)
             .await
             .unwrap();
         assert_eq!(messages1_after.len(), 0); // Should have no messages after commit
@@ -382,7 +511,7 @@ mod tests {
 
         // Test subscribing to non-existent topic
         assert!(matches!(
-            mq.subscribe("non-existent", None).await,
+            mq.subscribe("non-existent", None, None, None, false).await,
             Err(MQError::TopicNotFound(_))
         ));
 
@@ -426,7 +555,7 @@ mod tests {
         // Publish and verify headers
         mq.publish("test-topic", message).await.unwrap();
         let messages = mq
-            .subscribe("test-topic", None)
+            .subscribe("test-topic", None, None, None, false)
             .await
             .unwrap();
         assert_eq!(messages[0].headers, headers);
@@ -464,7 +593,7 @@ mod tests {
 
         // Verify all messages were published
         let messages = mq
-            .subscribe("test-topic", None)
+            .subscribe("test-topic", None, None, None, false)
             .await
             .unwrap();
         assert_eq!(messages.len(), 5);
@@ -474,7 +603,7 @@ mod tests {
     async fn test_message_compression() {
         let dir = tempfile::tempdir().unwrap();
         let storage_path = dir.path().to_str().unwrap().to_string();
-        let mq = MessageQueue::new(&storage_path).unwrap();
+        let _mq = MessageQueue::new(&storage_path).unwrap();
 
         // Create a large message that should be compressed
         let large_payload = vec![0u8; 2048]; // 2KB of zeros
@@ -512,7 +641,7 @@ mod tests {
     async fn test_compression_error_handling() {
         let dir = tempdir().unwrap();
         let storage_path = dir.path().to_str().unwrap().to_string();
-        let mq = MessageQueue::new(&storage_path).unwrap();
+        let _mq = MessageQueue::new(&storage_path).unwrap();
 
         // Create a message with invalid compression flag
         let mut message = Message::new(
@@ -529,8 +658,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_message_encryption() {
+    #[tokio::test]
+    async fn test_message_encryption() {
         let storage_path = tempfile::tempdir().unwrap().path().to_path_buf();
         let _mq = MessageQueue::new(storage_path.to_str().unwrap()).unwrap();
 
@@ -558,5 +687,67 @@ mod tests {
         assert!(!message.is_encrypted);
         assert!(!message.headers.contains_key("encryption"));
         assert_eq!(message.payload, "Hello, encrypted world!".as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_retention_policies() {
+        let dir = tempdir().unwrap();
+        let mq = MessageQueue::new(dir.path().to_str().unwrap()).unwrap();
+
+        // Create topic with custom retention policy
+        let retention_policy = RetentionPolicy {
+            max_age_seconds: Some(60), // 1 minute
+            max_size_bytes: Some(1000), // 1KB
+        };
+        mq.create_topic_with_partitions("test-topic", 1, Some(retention_policy)).await;
+
+        // Publish messages
+        for _i in 0..5 {
+            let message = Message {
+                id: Uuid::new_v4(),
+                topic: "test-topic".to_string(),
+                payload: vec![0u8; 200], // 200 bytes per message
+                timestamp: chrono::Utc::now().timestamp(),
+                headers: HashMap::new(),
+                is_compressed: false,
+                is_encrypted: false,
+            };
+            mq.publish("test-topic", message).await.unwrap();
+        }
+
+        // Wait for retention policy to be enforced
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        mq.enforce_retention_policies().await;
+
+        // Verify messages are retained based on size
+        let messages = mq.subscribe("test-topic", Some(0), None, None, false).await.unwrap();
+        assert!(messages.len() <= 5); // Should have at most 5 messages (1000 bytes / 200 bytes per message)
+
+        // Create topic with time-based retention
+        let retention_policy = RetentionPolicy {
+            max_age_seconds: Some(1), // 1 second
+            max_size_bytes: None,
+        };
+        mq.create_topic_with_partitions("time-topic", 1, Some(retention_policy)).await;
+
+        // Publish message
+        let message = Message {
+            id: Uuid::new_v4(),
+            topic: "time-topic".to_string(),
+            payload: b"test".to_vec(),
+            timestamp: chrono::Utc::now().timestamp(),
+            headers: HashMap::new(),
+            is_compressed: false,
+            is_encrypted: false,
+        };
+        mq.publish("time-topic", message).await.unwrap();
+
+        // Wait for retention policy to be enforced
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        mq.enforce_retention_policies().await;
+
+        // Verify message is removed due to age
+        let messages = mq.subscribe("time-topic", Some(0), None, None, false).await.unwrap();
+        assert_eq!(messages.len(), 0);
     }
 } 

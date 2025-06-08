@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Created topic: {}", topic);
 
     // Subscribe to messages
-    let mut rx = client.subscribe(topic, None).await?;
+    let mut rx = client.subscribe(topic, None, None, None, None).await?;
     println!("Subscribed to topic: {}", topic);
 
     // Spawn a task to receive messages
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         
         let message = format!("Hello, World! Message {}", i);
         let message_id = client
-            .publish(topic, message.as_bytes().to_vec(), headers)
+            .publish(topic, message.as_bytes().to_vec(), headers, None)
             .await?;
         
         println!("Published message {} with ID: {}", i, message_id);

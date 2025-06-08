@@ -3,8 +3,9 @@ use uuid::Uuid;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::message_queue::{Message, MessageQueue, MQError};
+use crate::message_queue::{Message, MessageQueue, RetentionPolicy};
 use mq::message_queue_service_server::{MessageQueueService, MessageQueueServiceServer};
 use mq::{
     CommitOffsetRequest, CommitOffsetResponse, CreateTopicRequest, CreateTopicResponse,
@@ -17,7 +18,7 @@ pub mod mq {
 
 #[derive(Clone)]
 pub struct MQServer {
-    message_queue: MessageQueue,
+    message_queue: Arc<MessageQueue>,
 }
 
 #[tonic::async_trait]
@@ -76,7 +77,7 @@ impl MessageQueueService for MQServer {
         let message_queue = self.message_queue.clone();
         tokio::spawn(async move {
             let messages = message_queue
-                .subscribe(&req.topic, req.partition.map(|p| p as usize))
+                .subscribe(&req.topic, req.partition.map(|p| p as usize), req.replay_offset.map(|o| o as usize), req.replay_timestamp, req.dlq.unwrap_or(false))
                 .await;
             if let Ok(messages) = messages {
                 for mut msg in messages {
@@ -109,7 +110,20 @@ impl MessageQueueService for MQServer {
         request: Request<CreateTopicRequest>,
     ) -> Result<Response<CreateTopicResponse>, Status> {
         let req = request.into_inner();
-        self.message_queue.create_topic_with_partitions(&req.name, req.partition_count.unwrap_or(3) as usize).await;
+        
+        let retention_policy = if req.max_age_seconds.is_some() || req.max_size_bytes.is_some() {
+            Some(RetentionPolicy {
+                max_age_seconds: req.max_age_seconds,
+                max_size_bytes: req.max_size_bytes,
+            })
+        } else {
+            None
+        };
+
+        self.message_queue
+            .create_topic_with_partitions(&req.name, req.partition_count.unwrap_or(3) as usize, retention_policy)
+            .await;
+        
         Ok(Response::new(CreateTopicResponse { success: true }))
     }
 
@@ -127,12 +141,12 @@ impl MessageQueueService for MQServer {
 }
 
 impl MQServer {
-    pub fn new(message_queue: MessageQueue) -> Self {
+    pub fn new(message_queue: Arc<MessageQueue>) -> Self {
         Self { message_queue }
     }
 }
 
-pub async fn run_server(message_queue: MessageQueue, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(message_queue: Arc<MessageQueue>, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.parse()?;
     let server = MQServer::new(message_queue);
     println!("MQ Server listening on {}", addr);
@@ -154,7 +168,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage_path = dir.path().to_str().unwrap().to_string();
         let message_queue = MessageQueue::new(&storage_path).unwrap();
-        let server = MQServer::new(message_queue);
+        let server = MQServer::new(Arc::new(message_queue));
         (server, storage_path)
     }
 
@@ -166,6 +180,8 @@ mod tests {
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
             partition_count: Some(3),
+            max_age_seconds: None,
+            max_size_bytes: None,
         });
         let response = server.create_topic(create_req).await.unwrap();
         assert!(response.into_inner().success);
@@ -178,6 +194,7 @@ mod tests {
             payload: b"test message".to_vec(),
             headers,
             partition: None,
+            dlq: None,
         });
         let response = server.publish(publish_req).await.unwrap();
         let message_id = response.into_inner().message_id;
@@ -187,6 +204,9 @@ mod tests {
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "test-topic".to_string(),
             partition: None,
+            replay_offset: None,
+            replay_timestamp: None,
+            dlq: None,
         });
         let response = server.subscribe(subscribe_req).await.unwrap();
         let mut stream = response.into_inner();
@@ -208,6 +228,7 @@ mod tests {
             payload: b"test".to_vec(),
             headers: HashMap::new(),
             partition: None,
+            dlq: None,
         });
         let result = server.publish(publish_req).await;
         assert!(result.is_err());
@@ -216,6 +237,9 @@ mod tests {
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "non-existent".to_string(),
             partition: None,
+            replay_offset: None,
+            replay_timestamp: None,
+            dlq: None,
         });
         let result = server.subscribe(subscribe_req).await;
         assert!(result.is_err());
@@ -229,6 +253,8 @@ mod tests {
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
             partition_count: Some(3),
+            max_age_seconds: None,
+            max_size_bytes: None,
         });
         server.create_topic(create_req).await.unwrap();
 
@@ -239,6 +265,7 @@ mod tests {
                 payload: format!("message {}", i).into_bytes(),
                 headers: HashMap::new(),
                 partition: None,
+                dlq: None,
             });
             server.publish(publish_req).await.unwrap();
         }
@@ -247,6 +274,9 @@ mod tests {
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "test-topic".to_string(),
             partition: Some(0),
+            replay_offset: None,
+            replay_timestamp: None,
+            dlq: None,
         });
         let response = server.subscribe(subscribe_req).await.unwrap();
         let mut stream = response.into_inner();
@@ -271,6 +301,9 @@ mod tests {
             let subscribe_req = Request::new(SubscribeRequest {
                 topic: "test-topic".to_string(),
                 partition: Some(0),
+                replay_offset: None,
+                replay_timestamp: None,
+                dlq: None,
             });
             let response = server.subscribe(subscribe_req).await.unwrap();
             let mut stream = response.into_inner();
@@ -287,6 +320,8 @@ mod tests {
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
             partition_count: Some(3),
+            max_age_seconds: None,
+            max_size_bytes: None,
         });
         server.create_topic(create_req).await.unwrap();
 
@@ -297,6 +332,7 @@ mod tests {
                 payload: format!("message {}", i).into_bytes(),
                 headers: HashMap::new(),
                 partition: None,
+                dlq: None,
             });
             server.publish(publish_req).await.unwrap();
         }
@@ -309,6 +345,9 @@ mod tests {
                 let subscribe_req = Request::new(SubscribeRequest {
                     topic: "test-topic".to_string(),
                     partition: Some(i as u32),
+                    replay_offset: None,
+                    replay_timestamp: None,
+                    dlq: None,
                 });
                 let response = server_clone.subscribe(subscribe_req).await.unwrap();
                 let mut stream = response.into_inner();

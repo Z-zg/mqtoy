@@ -57,6 +57,40 @@ jobs:
         run: |
           choco install protoc
 
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install cross-compilation tools (macOS ARM64)
+        if: matrix.os == 'macos-latest' && matrix.target == 'aarch64-apple-darwin'
+        run: |
+          echo "CC_aarch64_apple_darwin=clang" >> $GITHUB_ENV
+          echo "CXX_aarch64_apple_darwin=clang++" >> $GITHUB_ENV
+          echo "AR_aarch64_apple_darwin=ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang" >> $GITHUB_ENV
+
+      - name: Install cross-compilation tools (macOS x86_64)
+        if: matrix.os == 'macos-latest' && matrix.target == 'x86_64-apple-darwin'
+        run: |
+          echo "CC_x86_64_apple_darwin=clang" >> $GITHUB_ENV
+          echo "CXX_x86_64_apple_darwin=clang++" >> $GITHUB_ENV
+          echo "AR_x86_64_apple_darwin=ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang" >> $GITHUB_ENV
+
+      - name: Install cross-compilation tools (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "CC_x86_64_pc_windows_msvc=cl.exe" >> $GITHUB_ENV
+          echo "CXX_x86_64_pc_windows_msvc=cl.exe" >> $GITHUB_ENV
+          echo "AR_x86_64_pc_windows_msvc=lib.exe" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe" >> $GITHUB_ENV
+
       - name: Build
         run: |
           cargo build --release --target ${{ matrix.target }}

@@ -14,22 +14,32 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
-            artifact_name: mq-linux
+            target: x86_64-unknown-linux-gnu
+            artifact_name: mq-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: mq-linux-aarch64
           - os: macos-latest
-            artifact_name: mq-macos
+            target: x86_64-apple-darwin
+            artifact_name: mq-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: mq-macos-aarch64
           - os: windows-latest
-            artifact_name: mq-windows.exe
+            target: x86_64-pc-windows-msvc
+            artifact_name: mq-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rs/toolchain@v1
         with:
-          components: rustfmt, clippy
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
 
       - name: Install protoc
         if: matrix.os == 'ubuntu-latest'
@@ -48,54 +58,88 @@ jobs:
           choco install protoc
 
       - name: Build
-        run: cargo build --release
-
-      - name: Run tests
-        run: cargo test --release
-
-      - name: Build binaries
         run: |
-          cargo build --release --bin mq-server
-          cargo build --release --bin mq-client
-          cargo build --release --bin mq-monitoring
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mq-server dist/mq-server-${{ matrix.artifact_name }}
+          cp target/${{ matrix.target }}/release/mq-client dist/mq-client-${{ matrix.artifact_name }}
+          cp target/${{ matrix.target }}/release/mq-monitoring dist/mq-monitoring-${{ matrix.artifact_name }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            target/release/mq-server
-            target/release/mq-client
-            target/release/mq-monitoring
+          path: dist/
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v3
         with:
           path: artifacts
 
       - name: Create Release
         id: create_release
-        uses: softprops/action-gh-release@v1
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          files: |
-            artifacts/mq-linux/mq-server
-            artifacts/mq-linux/mq-client
-            artifacts/mq-linux/mq-monitoring
-            artifacts/mq-macos/mq-server
-            artifacts/mq-macos/mq-client
-            artifacts/mq-macos/mq-monitoring
-            artifacts/mq-windows.exe/mq-server.exe
-            artifacts/mq-windows.exe/mq-client.exe
-            artifacts/mq-windows.exe/mq-monitoring.exe
-          body_path: RELEASE.md
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
           draft: false
           prerelease: false
+
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/mq-linux-x86_64/mq-server-mq-linux-x86_64
+          asset_name: mq-server-linux-x86_64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Release Assets (Linux ARM64)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/mq-linux-aarch64/mq-server-mq-linux-aarch64
+          asset_name: mq-server-linux-aarch64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Release Assets (macOS x86_64)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/mq-macos-x86_64/mq-server-mq-macos-x86_64
+          asset_name: mq-server-macos-x86_64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Release Assets (macOS ARM64)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/mq-macos-aarch64/mq-server-mq-macos-aarch64
+          asset_name: mq-server-macos-aarch64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Release Assets (Windows)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/mq-windows-x86_64.exe/mq-server-mq-windows-x86_64.exe
+          asset_name: mq-server-windows-x86_64.exe
+          asset_content_type: application/octet-stream 

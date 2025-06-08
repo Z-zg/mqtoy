@@ -28,20 +28,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os_suffix: linux-x64
             archive_ext: tar.gz
-            # No specific extra installer_deps needed for common Linux targets
-            installer_deps: "" 
+            installer_deps: ""
           - target: aarch64-unknown-linux-gnu
             os_suffix: linux-arm64
             archive_ext: tar.gz
-            installer_deps: "gcc-aarch64-linux-gnu" # Compiler for ARM64 Linux
+            installer_deps: "gcc-aarch64-linux-gnu"
           - target: x86_64-pc-windows-msvc
             os_suffix: windows-x64
             archive_ext: zip
-            installer_deps: "clang llvm lld" # Compilers for MSVC targets
-          - target: aarch66_pc-windows-msvc # FIX: Corrected typo from aarch64_pc to aarch64-pc
+            installer_deps: "clang llvm lld"
+          - target: aarch64-pc-windows-msvc
             os_suffix: windows-arm64
             archive_ext: zip
-            installer_deps: "clang llvm lld" # Compilers for MSVC targets
+            installer_deps: "clang llvm lld"
 
     steps:
     - name: Checkout code
@@ -54,21 +53,29 @@ jobs:
         version: '25.x' # Use the latest version from Protobuf 25 series
 
     - name: Install target-specific build dependencies
-      if: ${{ matrix.installer_deps != '' }} # Only run if dependencies are needed
+      if: ${{ matrix.installer_deps != '' }}
       run: |
         sudo apt-get update
         sudo apt-get install -y ${{ matrix.installer_deps }}
+
+    # For Windows MSVC ARM64 targets, prepare environment
+    - name: Setup MSVC for Windows ARM64
+      if: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mingw-w64 clang llvm lld
+        echo 'CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=lld-link' >> $GITHUB_ENV
+        echo 'CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_AR=llvm-ar' >> $GITHUB_ENV
 
     - name: Set up Rust toolchain for ${{ matrix.target }}
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
-        target: ${{ matrix.target }} # Install the specific target toolchain
+        target: ${{ matrix.target }}
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
       with:
-        # Cache key includes the target triple to differentiate dependencies for different platforms
         path: |
           ~/.cargo/registry
           ~/.cargo/git
@@ -81,22 +88,16 @@ jobs:
       run: cargo build --release --workspace --target ${{ matrix.target }}
 
     - name: Prepare and archive binaries for ${{ matrix.target }}
-      shell: bash # Ensure bash is used for scripting across OSes
+      shell: bash
       run: |
-        # Define the base directory name for the packaged binaries
         BUILD_DIR="mq-${{ matrix.os_suffix }}"
         mkdir -p "$BUILD_DIR"
 
-        # Define the directory where compiled binaries are located
         TARGET_DIR="target/${{ matrix.target }}/release"
-        
-        # Explicitly list your binary names as defined in Cargo.toml
-        # NOTE: If any of these change, update this array!
-        declare -a BINARY_NAMES=("mq-server" "mq-client" "mq-monitoring") 
-        
+        declare -a BINARY_NAMES=("mq-server" "mq-client" "mq-monitoring")
+
         FOUND_BINARIES=""
         for BIN_NAME in "${BINARY_NAMES[@]}"; do
-          # Check for executable with .exe extension on Windows, or without on others
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             if [ -f "${TARGET_DIR}/${BIN_NAME}.exe" ]; then
               FOUND_BINARIES+="${TARGET_DIR}/${BIN_NAME}.exe "
@@ -111,26 +112,19 @@ jobs:
         if [ -z "$FOUND_BINARIES" ]; then
           echo "Warning: No executable binaries found for target ${{ matrix.target }} in ${TARGET_DIR}."
           echo "Please ensure all expected binaries are built and match the names in BINARY_NAMES array."
-          # exit 1 # You might want to uncomment this to fail the build if no binaries are found
+          # exit 1 # Uncomment to fail if none found
         fi
 
-        # Copy the found binaries to the specific build directory
         cp $FOUND_BINARIES "$BUILD_DIR/"
 
-        # Create the archive
         ARCHIVE_NAME="${BUILD_DIR}.${{ matrix.archive_ext }}"
-        
-        # Use tar for .tar.gz (Linux/macOS) and for .zip on Linux (tar can create .zip)
-        # On Windows, GitHub Actions runners have Git Bash, so `zip` command is typically available,
-        # or we can use tar for zip if preferred for consistency.
         if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
-          # For Windows, use tar to create zip, as it's reliable in CI environments
           tar -a -cvf "${ARCHIVE_NAME}" "$BUILD_DIR"
-        else # .tar.gz
+        else
           tar -czvf "${ARCHIVE_NAME}" "$BUILD_DIR"
         fi
 
-        echo "ASSET_PATH=${ARCHIVE_NAME}" >> $GITHUB_ENV # Set environment variable for the next step
+        echo "ASSET_PATH=${ARCHIVE_NAME}" >> $GITHUB_ENV
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -139,16 +133,15 @@ jobs:
         path: ${{ env.ASSET_PATH }}
 
   # Build macOS targets (natively on macOS Runner)
-  # macOS cross-compilation from Linux is generally not feasible due to SDK requirements.
   build_macos:
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - x86_64-apple-darwin # macOS (Intel)
-          - aarch64-apple-darwin # macOS (Apple Silicon)
-        
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
         include:
           - target: x86_64-apple-darwin
             os_suffix: macos-x64
@@ -159,7 +152,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # --- Install protoc ---
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -192,12 +184,11 @@ jobs:
         mkdir -p "$BUILD_DIR"
 
         TARGET_DIR="target/${{ matrix.target }}/release"
-        
         declare -a BINARY_NAMES=("mq-server" "mq-client" "mq-monitoring")
-        
+
         FOUND_BINARIES=""
         for BIN_NAME in "${BINARY_NAMES[@]}"; do
-          if [ -f "${TARGET_DIR}/${BIN_NAME}" ]; then # macOS binaries don't have .exe extension
+          if [ -f "${TARGET_DIR}/${BIN_NAME}" ]; then
             FOUND_BINARIES+="${TARGET_DIR}/${BIN_NAME} "
           fi
         done
@@ -208,8 +199,7 @@ jobs:
         fi
 
         cp $FOUND_BINARIES "$BUILD_DIR/"
-        
-        # macOS will always use tar.gz for consistency
+
         ARCHIVE_NAME="${BUILD_DIR}.tar.gz"
         tar -czvf "${ARCHIVE_NAME}" "$BUILD_DIR"
 
@@ -223,22 +213,21 @@ jobs:
 
   # Release Job
   release:
-    needs: [build_linux_windows, build_macos] # Ensure all build jobs complete successfully
+    needs: [build_linux_windows, build_macos]
     runs-on: ubuntu-latest
-    # This job only runs when a tag starting with 'v' is pushed
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
-        path: ./artifacts # Download all built artifacts into this directory
+        path: ./artifacts
 
     - name: Create Release
       id: create_release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: ${{ github.ref }} # Use the Git Tag as the Release name
+        tag_name: ${{ github.ref }}
         name: Release ${{ github.ref }}
         body: |
           # Release Notes for ${{ github.ref }}
@@ -257,8 +246,8 @@ jobs:
 
           ---
           *(Auto-generated by GitHub Actions)*
-        draft: false # Set to true to create a draft release
-        prerelease: false # Set to true to create a pre-release
-        files: ./artifacts/* # Upload all downloaded artifacts as release assets
+        draft: false
+        prerelease: false
+        files: ./artifacts/*
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub's auto-generated token for release creation
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

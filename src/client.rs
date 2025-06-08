@@ -18,6 +18,7 @@ pub mod mq {
 pub struct MQClient {
     client: MessageQueueServiceClient<Channel>,
     consumer_id: String,
+    encryption_key: Option<Vec<u8>>,
 }
 
 impl MQClient {
@@ -27,12 +28,18 @@ impl MQClient {
         Ok(Self {
             client,
             consumer_id,
+            encryption_key: None,
         })
+    }
+
+    pub fn set_encryption_key(&mut self, key: Vec<u8>) {
+        self.encryption_key = Some(key);
     }
 
     pub async fn create_topic(&mut self, name: &str) -> Result<bool, Box<dyn StdError + Send + Sync>> {
         let request = CreateTopicRequest {
             name: name.to_string(),
+            partition_count: Some(3), // Default to 3 partitions
         };
         let response = self.client.create_topic(request).await?;
         Ok(response.into_inner().success)
@@ -44,10 +51,27 @@ impl MQClient {
         payload: Vec<u8>,
         headers: HashMap<String, String>,
     ) -> Result<String, Box<dyn StdError + Send + Sync>> {
-        let request = PublishRequest {
+        let mut message = Message {
+            id: Uuid::new_v4(),
             topic: topic.to_string(),
             payload,
+            timestamp: chrono::Utc::now().timestamp(),
             headers,
+            is_compressed: false,
+            is_encrypted: false,
+        };
+
+        // Encrypt if key is set
+        if let Some(ref key) = self.encryption_key {
+            message.encrypt(key)
+                .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>)?;
+        }
+
+        let request = PublishRequest {
+            topic: topic.to_string(),
+            payload: message.payload,
+            headers: message.headers,
+            partition: None, // Let server choose partition
         };
         let response = self.client.publish(request).await?;
         Ok(response.into_inner().message_id)
@@ -56,28 +80,42 @@ impl MQClient {
     pub async fn subscribe(
         &mut self,
         topic: &str,
-        consumer_group: &str,
+        partition: Option<usize>,
     ) -> Result<mpsc::Receiver<Result<Message, Box<dyn StdError + Send + Sync>>>, Box<dyn StdError + Send + Sync>> {
         let request = SubscribeRequest {
             topic: topic.to_string(),
-            consumer_group: consumer_group.to_string(),
-            consumer_id: self.consumer_id.clone(),
+            partition: partition.map(|p| p as u32),
         };
 
         let response = self.client.subscribe(request).await?;
         let mut stream = response.into_inner();
+        let encryption_key = self.encryption_key.clone();
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             while let Ok(Some(msg)) = stream.message().await {
-                let message = Message {
+                let mut message = Message {
                     id: Uuid::parse_str(&msg.id).unwrap(),
                     topic: msg.topic,
                     payload: msg.payload,
                     timestamp: msg.timestamp,
                     headers: msg.headers.clone(),
                     is_compressed: msg.headers.contains_key("compression"),
+                    is_encrypted: msg.headers.contains_key("encryption"),
                 };
+
+                // Decrypt if encrypted and key is set
+                if message.is_encrypted {
+                    if let Some(ref key) = encryption_key {
+                        if let Err(e) = message.decrypt(key) {
+                            if tx.send(Err(Box::new(e) as Box<dyn StdError + Send + Sync>)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 if tx.send(Ok(message)).await.is_err() {
                     break;
                 }
@@ -90,12 +128,12 @@ impl MQClient {
     pub async fn commit_offset(
         &mut self,
         topic: &str,
-        consumer_group: &str,
+        partition: usize,
         offset: u64,
     ) -> Result<bool, Box<dyn StdError + Send + Sync>> {
         let request = CommitOffsetRequest {
             topic: topic.to_string(),
-            consumer_group: consumer_group.to_string(),
+            partition: partition as u32,
             offset,
         };
         let response = self.client.commit_offset(request).await?;
@@ -184,7 +222,7 @@ mod tests {
 
         // Subscribe to messages
         let mut rx = client
-            .subscribe("test-topic", "test-group")
+            .subscribe("test-topic", None)
             .await
             .unwrap();
 
@@ -195,7 +233,7 @@ mod tests {
         assert_eq!(message.headers.get("key").unwrap(), "value");
 
         // Commit offset
-        let result = client.commit_offset("test-topic", "test-group", 1).await;
+        let result = client.commit_offset("test-topic", 0, 1).await;
         assert!(result.unwrap());
     }
 
@@ -214,7 +252,7 @@ mod tests {
         assert!(result.is_err());
 
         // Try to subscribe to non-existent topic
-        let result = client.subscribe("non-existent", "test-group").await;
+        let result = client.subscribe("non-existent", None).await;
         assert!(result.is_err());
     }
 
@@ -222,7 +260,6 @@ mod tests {
     async fn test_client_concurrent_operations() {
         let mut client = setup_test_client().await;
         let topic = format!("test-topic-{}", uuid::Uuid::new_v4());
-        let group = format!("test-group-{}", uuid::Uuid::new_v4());
         client.create_topic(&topic).await.unwrap();
 
         // Spawn multiple publishers
@@ -250,7 +287,7 @@ mod tests {
 
         // Subscribe and verify messages
         let mut rx = client
-            .subscribe(&topic, &group)
+            .subscribe(&topic, None)
             .await
             .unwrap();
 
@@ -287,7 +324,7 @@ mod tests {
 
         // Subscribe and verify the message
         let mut rx = client
-            .subscribe("compression-test", "test-group")
+            .subscribe("compression-test", None)
             .await
             .unwrap();
 
@@ -295,5 +332,38 @@ mod tests {
         assert_eq!(message.topic, "compression-test");
         assert_eq!(message.payload.len(), large_payload.len()); // Length should match after decompression
         assert!(!message.is_compressed); // Should be decompressed by the time we receive it
+    }
+
+    #[tokio::test]
+    async fn test_message_encryption() {
+        let mut client = setup_test_client().await;
+        client.create_topic("encryption-test").await.unwrap();
+
+        // Generate a random key
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).unwrap();
+        client.set_encryption_key(key.to_vec());
+
+        // Publish an encrypted message
+        let payload = b"Hello, encrypted world!".to_vec();
+        let message_id = client
+            .publish(
+                "encryption-test",
+                payload.clone(),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        // Subscribe and verify the message
+        let mut rx = client
+            .subscribe("encryption-test", None)
+            .await
+            .unwrap();
+
+        let message = rx.recv().await.unwrap().unwrap();
+        assert_eq!(message.topic, "encryption-test");
+        assert_eq!(message.payload, payload);
+        assert!(!message.is_encrypted); // Should be decrypted by the time we receive it
     }
 } 

@@ -13,6 +13,7 @@ message PublishRequest {
     string topic = 1;
     bytes payload = 2;
     map<string, string> headers = 3;
+    optional uint32 partition = 4;  // Optional partition to publish to
 }
 
 message PublishResponse {
@@ -21,8 +22,7 @@ message PublishResponse {
 
 message SubscribeRequest {
     string topic = 1;
-    string consumer_group = 2;
-    string consumer_id = 3;
+    optional uint32 partition = 2;  // Optional partition to subscribe to
 }
 
 message Message {
@@ -35,6 +35,7 @@ message Message {
 
 message CreateTopicRequest {
     string name = 1;
+    optional uint32 partition_count = 2;  // Optional number of partitions
 }
 
 message CreateTopicResponse {
@@ -43,7 +44,7 @@ message CreateTopicResponse {
 
 message CommitOffsetRequest {
     string topic = 1;
-    string consumer_group = 2;
+    uint32 partition = 2;  // Required partition
     uint64 offset = 3;
 }
 

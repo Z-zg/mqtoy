@@ -9,6 +9,11 @@ use std::io::Write;
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 #[derive(Debug, Error)]
 pub enum MQError {
@@ -20,6 +25,8 @@ pub enum MQError {
     StorageError(String),
     #[error("Compression error: {0}")]
     CompressionError(String),
+    #[error("Encryption error: {0}")]
+    EncryptionError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +37,7 @@ pub struct Message {
     pub timestamp: i64,
     pub headers: HashMap<String, String>,
     pub is_compressed: bool,
+    pub is_encrypted: bool,
 }
 
 impl Message {
@@ -41,6 +49,7 @@ impl Message {
             timestamp: chrono::Utc::now().timestamp(),
             headers,
             is_compressed: false,
+            is_encrypted: false,
         }
     }
 
@@ -82,6 +91,68 @@ impl Message {
         self.headers.remove("compression");
         Ok(())
     }
+
+    pub fn encrypt(&mut self, key: &[u8]) -> Result<(), MQError> {
+        if self.is_encrypted {
+            return Ok(());
+        }
+
+        // Generate a random nonce
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| MQError::EncryptionError(format!("Failed to generate nonce: {}", e)))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        // Create cipher
+        let cipher_key = Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(cipher_key);
+
+        // Encrypt the payload
+        let encrypted = cipher
+            .encrypt(nonce, self.payload.as_ref())
+            .map_err(|e| MQError::EncryptionError(format!("Failed to encrypt message: {}", e)))?;
+
+        // Store nonce and encrypted data
+        let mut encrypted_data = Vec::new();
+        encrypted_data.extend_from_slice(&nonce_bytes);
+        encrypted_data.extend_from_slice(&encrypted);
+
+        // Update message
+        self.payload = encrypted_data;
+        self.is_encrypted = true;
+        self.headers.insert("encryption".to_string(), "aes-256-gcm".to_string());
+
+        Ok(())
+    }
+
+    pub fn decrypt(&mut self, key: &[u8]) -> Result<(), MQError> {
+        if !self.is_encrypted {
+            return Ok(());
+        }
+
+        // Extract nonce from the beginning of the payload
+        if self.payload.len() < 12 {
+            return Err(MQError::EncryptionError("Invalid encrypted payload".to_string()));
+        }
+        let (nonce_bytes, encrypted) = self.payload.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        // Create cipher
+        let cipher_key = Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(cipher_key);
+
+        // Decrypt the payload
+        let decrypted = cipher
+            .decrypt(nonce, encrypted)
+            .map_err(|e| MQError::EncryptionError(format!("Failed to decrypt message: {}", e)))?;
+
+        // Update message
+        self.payload = decrypted;
+        self.is_encrypted = false;
+        self.headers.remove("encryption");
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,11 +162,17 @@ pub struct ConsumerGroup {
     pub consumers: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct Partition {
+    pub id: usize,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Topic {
     pub name: String,
-    pub messages: Vec<Message>,
-    pub consumer_groups: HashMap<String, ConsumerGroup>,
+    pub partitions: Vec<Partition>,
+    pub partition_count: usize,
 }
 
 #[derive(Clone)]
@@ -120,67 +197,59 @@ impl MessageQueue {
         topics.contains_key(name)
     }
 
-    pub async fn create_topic(&self, name: &str) {
+    pub async fn create_topic_with_partitions(&self, name: &str, partition_count: usize) {
         let mut topics = self.topics.write().await;
         if !topics.contains_key(name) {
+            let partitions = (0..partition_count)
+                .map(|id| Partition { id, messages: Vec::new() })
+                .collect();
             topics.insert(
                 name.to_string(),
                 Topic {
                     name: name.to_string(),
-                    messages: Vec::new(),
-                    consumer_groups: HashMap::new(),
+                    partitions,
+                    partition_count,
                 },
             );
         }
     }
 
+    pub async fn create_topic(&self, name: &str) {
+        self.create_topic_with_partitions(name, 3).await;
+    }
+
     pub async fn publish(&self, topic: &str, message: Message) -> Result<(), MQError> {
         let mut topics = self.topics.write().await;
-        let topic = topics
-            .get_mut(topic)
-            .ok_or_else(|| MQError::TopicNotFound(topic.to_string()))?;
-        
-        topic.messages.push(message);
+        let topic_obj = topics.get_mut(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        let partition_id = (message.id.as_u128() as usize) % topic_obj.partition_count;
+        let partition = topic_obj.partitions.get_mut(partition_id).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        partition.messages.push(message);
         Ok(())
     }
 
-    pub async fn subscribe(
-        &self,
-        topic: &str,
-        consumer_group: &str,
-        consumer_id: &str,
-    ) -> Result<Vec<Message>, MQError> {
-        let mut topics = self.topics.write().await;
-        let topic = topics
-            .get_mut(topic)
-            .ok_or_else(|| MQError::TopicNotFound(topic.to_string()))?;
-
-        let group = topic
-            .consumer_groups
-            .entry(consumer_group.to_string())
-            .or_insert_with(|| ConsumerGroup {
-                id: consumer_group.to_string(),
-                offset: 0,
-                consumers: Vec::new(),
-            });
-
-        if !group.consumers.contains(&consumer_id.to_string()) {
-            group.consumers.push(consumer_id.to_string());
+    pub async fn subscribe(&self, topic: &str, partition: Option<usize>) -> Result<Vec<Message>, MQError> {
+        let topics = self.topics.read().await;
+        let topic_obj = topics.get(topic).ok_or(MQError::TopicNotFound(topic.to_string()))?;
+        let mut messages = Vec::new();
+        match partition {
+            Some(pid) => {
+                if let Some(partition) = topic_obj.partitions.get(pid) {
+                    messages.extend_from_slice(&partition.messages);
+                }
+            }
+            None => {
+                for partition in &topic_obj.partitions {
+                    messages.extend_from_slice(&partition.messages);
+                }
+            }
         }
-
-        let messages = topic.messages
-            .iter()
-            .skip(group.offset as usize)
-            .cloned()
-            .collect();
-
         Ok(messages)
     }
 
     pub async fn commit_offset(
         &self,
         topic: &str,
-        consumer_group: &str,
+        partition: usize,
         offset: u64,
     ) -> Result<(), MQError> {
         let mut topics = self.topics.write().await;
@@ -188,12 +257,16 @@ impl MessageQueue {
             .get_mut(topic)
             .ok_or_else(|| MQError::TopicNotFound(topic.to_string()))?;
 
-        let group = topic
-            .consumer_groups
-            .get_mut(consumer_group)
-            .ok_or_else(|| MQError::ConsumerGroupNotFound(consumer_group.to_string()))?;
+        if partition >= topic.partition_count {
+            return Err(MQError::TopicNotFound(format!("Partition {} not found", partition)));
+        }
 
-        group.offset = offset;
+        // Truncate messages up to the offset
+        if let Some(partition) = topic.partitions.get_mut(partition) {
+            if offset as usize <= partition.messages.len() {
+                partition.messages.drain(..offset as usize);
+            }
+        }
         Ok(())
     }
 }
@@ -219,19 +292,20 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp(),
             headers: HashMap::new(),
             is_compressed: false,
+            is_encrypted: false,
         };
         mq.publish("test-topic", message.clone()).await.unwrap();
 
         // Subscribe and receive message
         let messages = mq
-            .subscribe("test-topic", "test-group", "consumer-1")
+            .subscribe("test-topic", None)
             .await
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload, b"test message");
 
         // Commit offset
-        mq.commit_offset("test-topic", "test-group", 1)
+        mq.commit_offset("test-topic", 0, 1)
             .await
             .unwrap();
     }
@@ -242,7 +316,7 @@ mod tests {
         let mq = MessageQueue::new(dir.path().to_str().unwrap()).unwrap();
 
         // Create topic and publish messages
-        mq.create_topic("test-topic").await;
+        mq.create_topic_with_partitions("test-topic", 3).await;
         for i in 0..3 {
             let message = Message {
                 id: Uuid::new_v4(),
@@ -251,34 +325,39 @@ mod tests {
                 timestamp: chrono::Utc::now().timestamp(),
                 headers: HashMap::new(),
                 is_compressed: false,
+                is_encrypted: false,
             };
             mq.publish("test-topic", message).await.unwrap();
         }
 
-        // Subscribe with multiple consumers in the same group
+        // Subscribe with multiple consumers to different partitions
         let messages1 = mq
-            .subscribe("test-topic", "test-group", "consumer-1")
+            .subscribe("test-topic", Some(0))
             .await
             .unwrap();
         let messages2 = mq
-            .subscribe("test-topic", "test-group", "consumer-2")
+            .subscribe("test-topic", Some(1))
+            .await
+            .unwrap();
+        let messages3 = mq
+            .subscribe("test-topic", Some(2))
             .await
             .unwrap();
 
-        assert_eq!(messages1.len(), 3);
-        assert_eq!(messages2.len(), 3);
+        // Total messages across all partitions should be 3
+        assert_eq!(messages1.len() + messages2.len() + messages3.len(), 3);
 
-        // Commit offset for first consumer
-        mq.commit_offset("test-topic", "test-group", 2)
+        // Commit offset for first partition
+        mq.commit_offset("test-topic", 0, messages1.len() as u64)
             .await
             .unwrap();
 
-        // Subscribe again with first consumer
+        // Subscribe again to first partition
         let messages1_after = mq
-            .subscribe("test-topic", "test-group", "consumer-1")
+            .subscribe("test-topic", Some(0))
             .await
             .unwrap();
-        assert_eq!(messages1_after.len(), 1); // Should only get the last message
+        assert_eq!(messages1_after.len(), 0); // Should have no messages after commit
     }
 
     #[tokio::test]
@@ -294,6 +373,7 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp(),
             headers: HashMap::new(),
             is_compressed: false,
+            is_encrypted: false,
         };
         assert!(matches!(
             mq.publish("non-existent", message).await,
@@ -302,21 +382,21 @@ mod tests {
 
         // Test subscribing to non-existent topic
         assert!(matches!(
-            mq.subscribe("non-existent", "group", "consumer").await,
+            mq.subscribe("non-existent", None).await,
             Err(MQError::TopicNotFound(_))
         ));
 
         // Test committing offset for non-existent topic
         assert!(matches!(
-            mq.commit_offset("non-existent", "group", 0).await,
+            mq.commit_offset("non-existent", 0, 0).await,
             Err(MQError::TopicNotFound(_))
         ));
 
-        // Create topic and test committing offset for non-existent consumer group
+        // Create topic and test committing offset for non-existent partition
         mq.create_topic("test-topic").await;
         assert!(matches!(
-            mq.commit_offset("test-topic", "non-existent", 0).await,
-            Err(MQError::ConsumerGroupNotFound(_))
+            mq.commit_offset("test-topic", 10, 0).await,
+            Err(MQError::TopicNotFound(_))
         ));
     }
 
@@ -340,12 +420,13 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp(),
             headers: headers.clone(),
             is_compressed: false,
+            is_encrypted: false,
         };
 
         // Publish and verify headers
         mq.publish("test-topic", message).await.unwrap();
         let messages = mq
-            .subscribe("test-topic", "test-group", "consumer-1")
+            .subscribe("test-topic", None)
             .await
             .unwrap();
         assert_eq!(messages[0].headers, headers);
@@ -369,6 +450,7 @@ mod tests {
                     timestamp: chrono::Utc::now().timestamp(),
                     headers: HashMap::new(),
                     is_compressed: false,
+                    is_encrypted: false,
                 };
                 mq_clone.publish("test-topic", message).await
             });
@@ -382,7 +464,7 @@ mod tests {
 
         // Verify all messages were published
         let messages = mq
-            .subscribe("test-topic", "test-group", "consumer-1")
+            .subscribe("test-topic", None)
             .await
             .unwrap();
         assert_eq!(messages.len(), 5);
@@ -445,5 +527,36 @@ mod tests {
             message.decompress(),
             Err(MQError::CompressionError(_))
         ));
+    }
+
+    #[test]
+    fn test_message_encryption() {
+        let storage_path = tempfile::tempdir().unwrap().path().to_path_buf();
+        let _mq = MessageQueue::new(storage_path.to_str().unwrap()).unwrap();
+
+        // Create a test message
+        let mut message = Message {
+            id: Uuid::new_v4(),
+            topic: "test-topic".to_string(),
+            payload: "Hello, encrypted world!".as_bytes().to_vec(),
+            headers: HashMap::new(),
+            is_compressed: false,
+            is_encrypted: false,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+
+        // Test encryption
+        let key = [1u8; 32]; // 256-bit key
+        message.encrypt(&key).unwrap();
+        assert!(message.is_encrypted);
+        assert!(message.headers.contains_key("encryption"));
+        assert_eq!(message.headers.get("encryption").unwrap(), "aes-256-gcm");
+        assert!(message.payload.len() > 12); // Should have nonce (12 bytes) + encrypted data
+
+        // Test decryption
+        message.decrypt(&key).unwrap();
+        assert!(!message.is_encrypted);
+        assert!(!message.headers.contains_key("encryption"));
+        assert_eq!(message.payload, "Hello, encrypted world!".as_bytes());
     }
 } 

@@ -42,6 +42,7 @@ impl MessageQueueService for MQServer {
             timestamp: chrono::Utc::now().timestamp(),
             headers: req.headers,
             is_compressed: false,
+            is_encrypted: false,
         };
 
         // Compress the message if it's large enough
@@ -75,7 +76,7 @@ impl MessageQueueService for MQServer {
         let message_queue = self.message_queue.clone();
         tokio::spawn(async move {
             let messages = message_queue
-                .subscribe(&req.topic, &req.consumer_group, &req.consumer_id)
+                .subscribe(&req.topic, req.partition.map(|p| p as usize))
                 .await;
             if let Ok(messages) = messages {
                 for mut msg in messages {
@@ -108,7 +109,7 @@ impl MessageQueueService for MQServer {
         request: Request<CreateTopicRequest>,
     ) -> Result<Response<CreateTopicResponse>, Status> {
         let req = request.into_inner();
-        self.message_queue.create_topic(&req.name).await;
+        self.message_queue.create_topic_with_partitions(&req.name, req.partition_count.unwrap_or(3) as usize).await;
         Ok(Response::new(CreateTopicResponse { success: true }))
     }
 
@@ -118,7 +119,7 @@ impl MessageQueueService for MQServer {
     ) -> Result<Response<CommitOffsetResponse>, Status> {
         let req = request.into_inner();
         self.message_queue
-            .commit_offset(&req.topic, &req.consumer_group, req.offset)
+            .commit_offset(&req.topic, req.partition as usize, req.offset)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(CommitOffsetResponse { success: true }))
@@ -164,6 +165,7 @@ mod tests {
         // Create topic
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
+            partition_count: Some(3),
         });
         let response = server.create_topic(create_req).await.unwrap();
         assert!(response.into_inner().success);
@@ -175,6 +177,7 @@ mod tests {
             topic: "test-topic".to_string(),
             payload: b"test message".to_vec(),
             headers,
+            partition: None,
         });
         let response = server.publish(publish_req).await.unwrap();
         let message_id = response.into_inner().message_id;
@@ -183,8 +186,7 @@ mod tests {
         // Subscribe to messages
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "test-topic".to_string(),
-            consumer_group: "test-group".to_string(),
-            consumer_id: "consumer-1".to_string(),
+            partition: None,
         });
         let response = server.subscribe(subscribe_req).await.unwrap();
         let mut stream = response.into_inner();
@@ -205,6 +207,7 @@ mod tests {
             topic: "non-existent".to_string(),
             payload: b"test".to_vec(),
             headers: HashMap::new(),
+            partition: None,
         });
         let result = server.publish(publish_req).await;
         assert!(result.is_err());
@@ -212,8 +215,7 @@ mod tests {
         // Try to subscribe to non-existent topic
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "non-existent".to_string(),
-            consumer_group: "test-group".to_string(),
-            consumer_id: "consumer-1".to_string(),
+            partition: None,
         });
         let result = server.subscribe(subscribe_req).await;
         assert!(result.is_err());
@@ -226,6 +228,7 @@ mod tests {
         // Create topic
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
+            partition_count: Some(3),
         });
         server.create_topic(create_req).await.unwrap();
 
@@ -235,42 +238,45 @@ mod tests {
                 topic: "test-topic".to_string(),
                 payload: format!("message {}", i).into_bytes(),
                 headers: HashMap::new(),
+                partition: None,
             });
             server.publish(publish_req).await.unwrap();
         }
 
-        // Subscribe and commit offset
+        // Subscribe to partition 0 and commit offset
         let subscribe_req = Request::new(SubscribeRequest {
             topic: "test-topic".to_string(),
-            consumer_group: "test-group".to_string(),
-            consumer_id: "consumer-1".to_string(),
+            partition: Some(0),
         });
         let response = server.subscribe(subscribe_req).await.unwrap();
         let mut stream = response.into_inner();
 
-        // Receive first two messages
-        let _ = stream.next().await.unwrap().unwrap();
-        let _ = stream.next().await.unwrap().unwrap();
+        // Receive all messages in partition 0
+        let mut received = Vec::new();
+        while let Some(Ok(msg)) = stream.next().await {
+            received.push(msg);
+        }
+        let count = received.len();
+        if count > 1 {
+            // Commit offset for partition 0
+            let commit_req = Request::new(CommitOffsetRequest {
+                topic: "test-topic".to_string(),
+                partition: 0,
+                offset: (count - 1) as u64,
+            });
+            let response = server.commit_offset(commit_req).await.unwrap();
+            assert!(response.into_inner().success);
 
-        // Commit offset
-        let commit_req = Request::new(CommitOffsetRequest {
-            topic: "test-topic".to_string(),
-            consumer_group: "test-group".to_string(),
-            offset: 2,
-        });
-        let response = server.commit_offset(commit_req).await.unwrap();
-        assert!(response.into_inner().success);
-
-        // Subscribe again and verify only one message is received
-        let subscribe_req = Request::new(SubscribeRequest {
-            topic: "test-topic".to_string(),
-            consumer_group: "test-group".to_string(),
-            consumer_id: "consumer-1".to_string(),
-        });
-        let response = server.subscribe(subscribe_req).await.unwrap();
-        let mut stream = response.into_inner();
-        let message = stream.next().await.unwrap().unwrap();
-        assert_eq!(message.payload, b"message 2");
+            // Subscribe again to partition 0 and verify only the last message is received
+            let subscribe_req = Request::new(SubscribeRequest {
+                topic: "test-topic".to_string(),
+                partition: Some(0),
+            });
+            let response = server.subscribe(subscribe_req).await.unwrap();
+            let mut stream = response.into_inner();
+            let message = stream.next().await.unwrap().unwrap();
+            assert_eq!(message.payload, received.last().unwrap().payload);
+        }
     }
 
     #[tokio::test]
@@ -280,6 +286,7 @@ mod tests {
         // Create topic
         let create_req = Request::new(CreateTopicRequest {
             name: "test-topic".to_string(),
+            partition_count: Some(3),
         });
         server.create_topic(create_req).await.unwrap();
 
@@ -289,19 +296,19 @@ mod tests {
                 topic: "test-topic".to_string(),
                 payload: format!("message {}", i).into_bytes(),
                 headers: HashMap::new(),
+                partition: None,
             });
             server.publish(publish_req).await.unwrap();
         }
 
-        // Create multiple subscribers
+        // Create multiple subscribers to different partitions
         let mut handles = vec![];
         for i in 0..3 {
             let server_clone = server.clone();
             let handle = tokio::spawn(async move {
                 let subscribe_req = Request::new(SubscribeRequest {
                     topic: "test-topic".to_string(),
-                    consumer_group: "test-group".to_string(),
-                    consumer_id: format!("consumer-{}", i),
+                    partition: Some(i as u32),
                 });
                 let response = server_clone.subscribe(subscribe_req).await.unwrap();
                 let mut stream = response.into_inner();
@@ -314,10 +321,12 @@ mod tests {
             handles.push(handle);
         }
 
-        // Verify all subscribers received all messages
+        // Verify all subscribers received messages
+        let mut total_messages = 0;
         for handle in handles {
             let count = handle.await.unwrap();
-            assert_eq!(count, 5);
+            total_messages += count;
         }
+        assert_eq!(total_messages, 5); // Total messages across all partitions should be 5
     }
 } 

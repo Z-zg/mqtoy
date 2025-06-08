@@ -1,36 +1,28 @@
-# Distributed Message Queue
+# Message Queue System
 
-A high-performance, distributed message queue system written in Rust. This project implements a message queue with the following features:
-
-- Topic-based message routing
-- Consumer groups support
-- Message persistence using Sled
-- gRPC-based communication
-- Distributed architecture with leader election
-- Message ordering and delivery guarantees
+A high-performance, distributed message queue system written in Rust, featuring compression, encryption, persistence, and concurrent message handling.
 
 ## Features
 
-- **Topic-based Routing**: Messages are organized into topics, allowing for flexible message routing
-- **Consumer Groups**: Support for consumer groups with offset tracking
-- **Persistence**: Messages are persisted using Sled, an embedded key-value database
-- **gRPC API**: Modern, efficient communication using Protocol Buffers and gRPC
-- **Distributed**: Support for distributed deployment with leader election
-- **Message Ordering**: Guaranteed message ordering within topics
-- **Delivery Guarantees**: At-least-once delivery semantics
+- **Message Compression**: Automatic compression for messages larger than 1KB
+- **Message Encryption**: AES-256-GCM encryption for secure message transmission
+- **Persistence**: Message storage with sled database
+- **Concurrent Operations**: Support for multiple publishers and subscribers
+- **Consumer Groups**: Group-based message consumption with offset tracking
+- **gRPC Interface**: Modern RPC interface for client-server communication
+- **Distributed Architecture**: Support for multiple nodes with leader election
 
-## Getting Started
+## Prerequisites
 
-### Prerequisites
-
-- Rust 1.70 or later
+- Rust (latest stable version)
 - Protocol Buffers compiler (protoc)
+- grpcurl (for testing with CLI)
 
-### Installation
+## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/mq.git
+git clone <repository-url>
 cd mq
 ```
 
@@ -39,52 +31,122 @@ cd mq
 cargo build --release
 ```
 
-3. Run the server:
+## Running the Server
+
+Start the server with default settings:
 ```bash
-./target/release/mq-server
+cargo run --release
 ```
 
-### Configuration
-
-The server can be configured using command-line arguments:
-
-- `--addr`: The address to bind the server to (default: "[::1]:50051")
-- `--data-dir`: The path to store the message queue data (default: "data/mq")
-
-Example:
+Or with custom settings:
 ```bash
-./target/release/mq-server --addr "127.0.0.1:50051" --data-dir "/var/lib/mq"
+cargo run --release -- --addr "[::1]:50051" --data-dir "./data"
 ```
 
-## API
+## Using the Client
 
-The message queue exposes a gRPC API with the following operations:
+### Rust Client
 
-- `Publish`: Send a message to a topic
-- `Subscribe`: Subscribe to messages from a topic
-- `CreateTopic`: Create a new topic
-- `CommitOffset`: Commit the current offset for a consumer group
+```rust
+use mq::client::MQClient;
+use std::collections::HashMap;
 
-## Development
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a new client
+    let mut client = MQClient::new("http://[::1]:50051".to_string()).await?;
 
-### Building
+    // Set encryption key (32 bytes for AES-256)
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key)?;
+    client.set_encryption_key(key.to_vec());
 
-```bash
-cargo build
+    // Create a topic
+    client.create_topic("secure-topic").await?;
+
+    // Publish an encrypted message
+    let mut headers = HashMap::new();
+    headers.insert("key".to_string(), "value".to_string());
+    client.publish(
+        "secure-topic",
+        b"Sensitive data".to_vec(),
+        headers,
+    ).await?;
+
+    // Subscribe to messages (they will be automatically decrypted)
+    let mut rx = client.subscribe("secure-topic", "secure-group").await?;
+    
+    // Receive and process decrypted messages
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(message) => {
+                println!("Received: {}", String::from_utf8_lossy(&message.payload));
+            }
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    }
+
+    Ok(())
+}
 ```
 
-### Testing
+The encryption is transparent to the application - messages are automatically encrypted when published and decrypted when received, as long as the same encryption key is used.
 
+### Using grpcurl
+
+Create a topic:
+```bash
+grpcurl -plaintext -d '{"name": "test-topic"}' [::1]:50051 mq.MessageQueueService/CreateTopic
+```
+
+Publish a message:
+```bash
+grpcurl -plaintext -d '{
+  "topic": "test-topic",
+  "payload": "SGVsbG8sIFdvcmxkIQ==",
+  "headers": {"key": "value"}
+}' [::1]:50051 mq.MessageQueueService/Publish
+```
+
+Subscribe to messages:
+```bash
+grpcurl -plaintext -d '{
+  "topic": "test-topic",
+  "consumer_group": "test-group",
+  "consumer_id": "consumer-1"
+}' [::1]:50051 mq.MessageQueueService/Subscribe
+```
+
+## Testing
+
+Run all tests:
 ```bash
 cargo test
 ```
 
-### Running with Docker
-
+Run specific test:
 ```bash
-docker build -t mq-server .
-docker run -p 50051:50051 mq-server
+cargo test test_name
 ```
+
+## Project Structure
+
+```
+src/
+├── client.rs         # Client implementation
+├── coordinator.rs    # Distributed coordination
+├── message_queue.rs  # Core message queue logic
+├── server.rs        # gRPC server implementation
+└── storage.rs       # Message persistence
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 

@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Created topic: {}", topic);
 
     // Subscribe to messages
-    let consumer_group = "example-group";
-    let mut rx = client.subscribe(topic, consumer_group).await?;
+    let mut rx = client.subscribe(topic, None).await?;
     println!("Subscribed to topic: {}", topic);
 
     // Spawn a task to receive messages
@@ -58,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Received {} messages", received_count);
 
     // Commit offset
-    client.commit_offset(topic, consumer_group, received_count as u64).await?;
+    client.commit_offset(topic, 0, received_count as u64).await?;
     println!("Committed offset: {}", received_count);
 
     Ok(())

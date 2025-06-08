@@ -95,9 +95,15 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }}
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/mq-server dist/mq-server-${{ matrix.artifact_name }}
-          cp target/${{ matrix.target }}/release/mq-client dist/mq-client-${{ matrix.artifact_name }}
-          cp target/${{ matrix.target }}/release/mq-monitoring dist/mq-monitoring-${{ matrix.artifact_name }}
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/mq-server.exe dist/mq-server-${{ matrix.artifact_name }}
+            cp target/${{ matrix.target }}/release/mq-client.exe dist/mq-client-${{ matrix.artifact_name }}
+            cp target/${{ matrix.target }}/release/mq-monitoring.exe dist/mq-monitoring-${{ matrix.artifact_name }}
+          else
+            cp target/${{ matrix.target }}/release/mq-server dist/mq-server-${{ matrix.artifact_name }}
+            cp target/${{ matrix.target }}/release/mq-client dist/mq-client-${{ matrix.artifact_name }}
+            cp target/${{ matrix.target }}/release/mq-monitoring dist/mq-monitoring-${{ matrix.artifact_name }}
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: mq-linux
+          - os: macos-latest
+            artifact_name: mq-macos
+          - os: windows-latest
+            artifact_name: mq-windows.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install protoc
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Build binaries
+        run: |
+          cargo build --release --bin mq-server
+          cargo build --release --bin mq-client
+          cargo build --release --bin mq-monitoring
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            target/release/mq-server
+            target/release/mq-client
+            target/release/mq-monitoring
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/mq-linux/mq-server
+            artifacts/mq-linux/mq-client
+            artifacts/mq-linux/mq-monitoring
+            artifacts/mq-macos/mq-server
+            artifacts/mq-macos/mq-client
+            artifacts/mq-macos/mq-monitoring
+            artifacts/mq-windows.exe/mq-server.exe
+            artifacts/mq-windows.exe/mq-client.exe
+            artifacts/mq-windows.exe/mq-monitoring.exe
+          body_path: RELEASE.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

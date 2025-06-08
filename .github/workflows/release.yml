@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build
@@ -120,6 +123,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -129,23 +134,15 @@ jobs:
           path: artifacts
 
       - name: Create Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
-        with:
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           files: |
             artifacts/mq-linux-x86_64/mq-server-mq-linux-x86_64
             artifacts/mq-linux-aarch64/mq-server-mq-linux-aarch64
             artifacts/mq-macos-x86_64/mq-server-mq-macos-x86_64
             artifacts/mq-macos-aarch64/mq-server-mq-macos-aarch64
             artifacts/mq-windows-x86_64.exe/mq-server-mq-windows-x86_64.exe
-          tag_name: ${{ github.ref }}
           draft: false
           prerelease: false 

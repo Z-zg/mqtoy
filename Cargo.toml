@@ -1,7 +1,22 @@
+[[bin]]
+name = "mq-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "mq-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "mq-monitoring"
+path = "src/bin/monitoring.rs"
+
+
 [package]
 name = "mq"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+authors = ["zzq <zhaoguangqing7@gmail.com>"]
+description = "A high-performance message queue system written in Rust"
 
 [[example]]
 name = "client_example"
@@ -17,7 +32,7 @@ tonic = "0.10"
 prost = "0.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-uuid = { version = "1.0", features = ["v4", "serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
 async-trait = "0.1"
 thiserror = "1.0"
 structopt = "0.3"
@@ -38,3 +53,4 @@ tonic-build = "0.10"
 
 [dev-dependencies]
 tempfile = "3.8"
+tokio-test = "0.4"

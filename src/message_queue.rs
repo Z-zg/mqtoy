@@ -750,4 +750,17 @@ mod tests {
         let messages = mq.subscribe("time-topic", Some(0), None, None, false).await.unwrap();
         assert_eq!(messages.len(), 0);
     }
+
+    #[test]
+    fn test_invalid_storage_path() {
+        // 使用无效的存储路径
+        let invalid_path = if cfg!(windows) {
+            "C:\\invalid\\path\\with\\invalid\\chars\\*\\?"
+        } else {
+            "/invalid/path/with/invalid/chars/*/?"
+        };
+        
+        let result = MessageQueue::new(invalid_path);
+        assert!(result.is_err());
+    }
 } 
